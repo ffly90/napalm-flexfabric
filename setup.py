@@ -17,7 +17,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name='napalm_flexfabric',  
-    version='0.1',
+    version='0.2',
     packages=setuptools.find_packages(),
     author="Steffen Walter",
     author_email="steffen.walter@atos.net",
