@@ -32,6 +32,7 @@ import napalm.base.constants as C
 import napalm.base.helpers
 import re
 import socket
+import string
 
 
 # Constants
@@ -41,7 +42,7 @@ WEEK_SECONDS = 7 * DAY_SECONDS
 YEAR_SECONDS = 365 * DAY_SECONDS
 
 class FlexFabricDriver(NetworkDriver):
-    """Napalm driver for HP FlexFabric"""
+    """Napalm driver for HPE FlexFabric Switches"""
 
     def __init__(self, hostname, username, password, timeout=60, optional_args=None):
         self.device = None
@@ -159,19 +160,20 @@ class FlexFabricDriver(NetworkDriver):
         display_ver = self._send_command("display version")
         display_curr_conf = self._send_command("display current-configuration | include sysname")
         display_domain = self._send_command("display domain | include Domain")
-        display_interface = self._send_command("display interface brief | begin \"Interface            Link Speed\"")
-        
+        display_interface = self._send_command("display interface brief")
+
         # serial number
+        chassis = False
         for line in display_dev.splitlines():
-            if not line.startswith(" ") and "Chassis self" in line:
+            if not line.startswith(" ") and ("Chassis self" in line or "Slot" in line)\
+            or ("Slot" in line and "CPU" in line):
                 chassis = True
-            elif not line.startswith(" ") and not "Chassis self" in line:
-                chassis = False
-            if line.startswith(" DEVICE_SERIAL_NUMBER") and chassis:
+            if chassis and "DEVICE_SERIAL_NUMBER" in line:
                 serial_number += (line.split(":")[1])
+                chassis = False
         serial_number = serial_number.strip()
 
-        # uptime/model/version
+        # uptime/model/os_version
         for line in display_ver.splitlines():
             if " uptime is " in line:
                 model, uptime_str = line.split(" uptime is ")
@@ -180,23 +182,30 @@ class FlexFabricDriver(NetworkDriver):
 
             if "System image version" in line:
                 os_version = line.split(":")[1].strip()
-        
+            elif "Comware Software, Version" in line:
+                os_version = line.lstrip("Comware Software, Version")
+
         # hostname
         hostname = display_curr_conf.split("sysname")[1].strip()
-        
+
         # domain name
-        domain_name = display_domain.split(":")[1].strip()
+        domain_name = display_domain.splitlines()[0].split(":")[1].strip()
 
         #fqdn
         if domain_name != "system":
             fqdn = "{}.{}".format(hostname, domain_name)
         else:
             fqdn = hostname
-        
+
         #interface list
         interface_list = []
-        for line in display_interface.splitlines()[1:]:
-            interface_list.append(line.split()[0])
+        active = False
+        for line in display_interface.splitlines():
+            if line.startswith("Interface            Link Speed"):
+                active = True
+                continue
+            if active:
+                interface_list.append(line.split()[0])
         
         return {
             "uptime": int(uptime),
@@ -210,17 +219,216 @@ class FlexFabricDriver(NetworkDriver):
         }
 
     def get_lldp_neighbors(self):
+        """FlexFabric implementation of get_lldp_neighbors."""
+        lldp = {}
+        command = "display lldp neighbor-information list"
+        output = self._send_command(command)
+        active = False
+        for line in output.splitlines():
+            if line.startswith("System Name"):
+                active = True
+                continue
+            if active:
+                remote_sys, local_if, _, remote_port = line.split()
+                lldp[local_if] = [{"hostname": remote_sys, "port": remote_port}]
+        if not lldp:
+            for line in output.splitlines():
+                if line.startswith("Local Interface"):
+                    active = True
+                    continue
+                if active:
+                    split_line = line.split()
+                    local_if, remote_port, remote_sys = split_line[0], split_line[-2], split_line[-1]
+                    lldp[local_if] = [{"hostname": remote_sys, "port": remote_port}]
+
+        return lldp
+
+    def get_lldp_neighbors_detail(self, interface=""):
+        lldp = {}
+        lldp_interfaces = []
+
+        if interface:
+            command = "display lldp neighbor-information interface {} verbose".format(interface)
+        else:
+            command = "display lldp neighbor-information verbose"
+
+        lldp_entries = self._send_command(command)
+
         #TODO
-        return
-    def get_lldp_neighbors_detail(self, interface=''):
-        #TODO
-        return
+
+        return {}
+
+
+
     def get_environment(self):
+
+        environment = {}
+
+        cpu_cmd = "display cpu-usage summary"
+        mem_cmd = "display memory summary"
+        temp_cmd = "display environment"
+        fan_cmd = "display fan"
+        pwr_cmd = "display power"
+
+        # fan health
+        output = self._send_command(fan_cmd)
+        environment.setdefault("fans", {})
+        active = False
+        chassis = 0
+        for line in output.splitlines():
+            if line.startswith(" ---"):
+                active = True
+                chassis +=1
+                continue
+            elif line == "" or line.startswith(" Fan-tray"):
+                active = False
+                continue
+            elif active == False:
+                continue
+            line_list = line.split()
+            if line_list[1] != "Normal":
+                fan_state = False
+            else:
+                fan_state = True
+            fan_id = str(chassis) + "_" + line_list[0]
+            environment["fans"][fan_id] = {
+                "status": fan_state
+            }
+        if not environment["fans"]:
+            for line in output.splitlines():
+                if line.startswith("Slot") or line.startswith(" Slot"):
+                    chassis +=1
+                    continue
+                elif "FAN" in line or "Fan " in line:
+                    fan_id = str(chassis) + "_" + line.split()[1].strip(":")
+                    continue
+                elif "State" in line:
+                    if line.split(":")[-1].strip() != "Normal":
+                        fan_state = False
+                    else:
+                        fan_state = True
+                    environment["fans"][fan_id] = {
+                        "status": fan_state
+                    }
+
+        # temperature sensors
+        output = self._send_command(temp_cmd)
+        environment.setdefault("temperature", {})
+        if "Slot" in output.splitlines()[0]:
+            slot = 0
+            active = False
+            for line in output.splitlines():
+                if "Slot" in line:
+                    slot += 1
+                    active = False
+                    continue
+                elif not active and line.startswith("Sensor"):
+                    active = True
+                    continue
+                if active:
+                    split_line = line.split()
+                    location = str(slot) + "_" + "_".join(split_line[0:2])
+                    temperature = float(split_line[2])
+                    environment["temperature"][location] = {
+                        "temperature": temperature,
+                        "is_alert": temperature > float(split_line[-3]),
+                        "is_critical": temperature > float(split_line[-2])
+                    }
+        else:
+            if "Chassis" in output.splitlines()[2]:
+                marker = 4
+            else:
+                marker = 3
+            for line in output.splitlines()[3:]:
+                split_line = line.split()
+                location = "_".join(split_line[0:marker])
+                temperature = float(split_line[marker])
+                environment["temperature"][location] = {
+                    "temperature": temperature,
+                    "is_alert": temperature > float(split_line[-3]),
+                    "is_critical": temperature > float(split_line[-2])
+                }
+
+        # power supply units
+        # currently not implemented
+        environment.setdefault('power', {})
+        environment['power']['invalid'] = {'status': True, 'output': -1.0, 'capacity': -1.0}
         #TODO
-        return
+
+        # cpu usage
+        output = self._send_command(cpu_cmd)
+        environment.setdefault("cpu", {})
+        usage = 0.0
+        if "Wrong parameter found at" in output:
+            output = self._send_command("display cpu-usage | include 1 minute")
+            for idx, line in enumerate(output.splitlines()):
+                environment["cpu"][idx] = {}
+                environment["cpu"][idx]["%usage"] = 0.0
+                usage = float(line.split()[0].strip("%"))
+                environment["cpu"][idx]["%usage"] = usage
+        else:
+            if "Chassis" in output.splitlines()[0]:
+                marker = 4
+            else:
+                marker = 3
+            for idx, line in enumerate(output.splitlines()[1:]):
+                environment["cpu"][idx] = {}
+                environment["cpu"][idx]["%usage"] = 0.0
+                usage = float(line.split()[marker].strip("%"))
+                environment["cpu"][idx]["%usage"] = usage
+
+        # memory usage
+        output = self._send_command(mem_cmd)
+        environment.setdefault("memory", {})
+        if "Too many parameters found at" in output:
+            output = self._send_command("display memory")
+            for line in output.splitlines():
+                if "Total Memory" in line:
+                    total = int(line.split(":")[-1].strip())
+                elif "Used Memory" in line:
+                    used = int(line.split(":")[-1].strip())
+        else:
+            if "Chassis" in output.splitlines()[1]:
+                marker = 1
+            else:
+                marker = 0
+            total = 0
+            used = 0
+            for line in output.splitlines()[2:]:
+                total += int(line.split()[2 + marker])
+                used += int(line.split()[3 + marker])
+        environment["memory"]["used_ram"] = used
+        environment["memory"]["available_ram"] = total
+
+        return environment
+
+
     def get_config(self, retrieve='all'):
-        #TODO
-        return
+        """get_config implementation for FlexFabric"""
+        get_startup = retrieve == "all" or retrieve == "startup"
+        get_running = retrieve == "all" or retrieve == "running"
+
+        if retrieve == "all" or get_startup or get_running:
+            command1 = "display current-configuration"
+            command2 = "display saved-configuration"
+            
+            output1 = self._send_command(command1)
+            output2 = self._send_command(command2)
+
+            return{
+                "startup": py23_compat.text_type(output2)
+                if get_startup
+                else "",
+                "running": py23_compat.text_type(output1)
+                if get_running
+                else "",
+                "candidate": ""
+            }
+        else:
+            return {"startup": "", "running": "", "candidate": ""}
+
+
+
     def get_ntp_servers(self):
         #TODO
         return
@@ -231,12 +439,44 @@ class FlexFabricDriver(NetworkDriver):
         #TODO
         return
     def get_interfaces(self):
-        #TODO
-        return
+        command = "display interface"
+        display_interface = self._send_command(command)
+
+        interfaces = {}
+        name_not_set = True
+        for line in display_interface.splitlines():
+            if not line:
+                name_not_set = True
+                continue
+            elif name_not_set:
+                interface = self._short_interface(line.split()[0])
+                interfaces[interface] = {}
+                name_not_set = False
+            if "Current state:" in line or "current state:" in line:
+                state = line.split()[-1]
+                if state == "UP":
+                    interfaces[interface]["is_up"] = True
+                    interfaces[interface]["is_enabled"] = True
+                else:
+                    interfaces[interface]["is_up"] = False
+                    if state == "ADM":
+                        interfaces[interface]["is_enabled"] = False
+                    else:
+                        interfaces[interface]["is_enabled"] = True
+            elif line.startswith("Bandwidth:"):
+                interfaces[interface]["speed"] = int(line.split()[-2].strip()) * 1e-3
+            elif line.startswith("Last link flapping:"):
+                interfaces[interface]["last_flapped"] = float(self.parse_uptime(line.split(":")[-1].strip()))
+            elif "hardware address" in line or "Hardware Address" in line:
+                interfaces[interface]["mac_address"] = napalm.base.helpers.convert(
+                    napalm.base.helpers.mac, line.split(":")[-1].strip()
+                )
+            elif "Description:" in line:
+                interfaces[interface]["description"] = line.split(":")[-1].strip()
+        return interfaces
+
+
     def get_interfaces_counters(self):
-        #TODO
-        return
-    def _parse_interface_details(self, interface='all'):
         #TODO
         return
 
@@ -274,3 +514,45 @@ class FlexFabricDriver(NetworkDriver):
             + seconds
         )
         return uptime_sec
+
+    @staticmethod
+    def _short_interface(interface):
+        """
+        Remove lower case characters from interface
+        name to get standard interface names
+        """
+        if interface.startswith("Ten-GigabitEthernet"):
+            interface = interface.replace("Ten-GigabitEthernet", "XGE")
+        elif interface.startswith("FortyGigE"):
+            interface = interface.replace("FortyGigE", "FGE")
+        elif interface.startswith("M-GigabitEthernet"):
+            interface = interface.replace("M-GigabitEthernet","MGE")
+        elif interface.startswith("Bridge-Aggregation"):
+            interface = interface.replace("Bridge-Aggregation","BAGG")
+        elif interface.startswith("HundredGigE"):
+            interface = interface.replace("HundredGigE","HGE")
+        elif interface.startswith("InLoopBack"):
+            interface = interface.replace("InLoopBack","InLoop")
+        elif interface.startswith("LoopBack"):
+            interface = interface.replace("LoopBack","Loop")
+        elif interface.startswith("Multicast Tunnel"):
+            interface = interface.replace("Multicast Tunnel","MTunnel")
+        elif interface.startswith("Register-Tunnel"):
+            interface = interface.replace("Register-Tunnel","REG")
+        elif interface.startswith("Route-Aggregation"):
+            interface = interface.replace("Route-Aggregation","RAGG")
+        elif interface.startswith("SAN-Aggregation"):
+            interface = interface.replace("SAN-Aggregation","SAGG")
+        elif interface.startswith("S-Channel"):
+            interface = interface.replace("S-Channel","S-Ch")
+        elif interface.startswith("Schannel-Aggregation"):
+            interface = interface.replace("Schannel-Aggregation","SCH-AGG")
+        elif interface.startswith("Schannel-Bundle"):
+            interface = interface.replace("Schannel-Bundle","SCH-B")
+        elif interface.startswith("Tunnel"):
+            interface = interface.replace("Tunnel","Tun")
+        elif interface.startswith("Vsi-interface"):
+            interface = interface.replace("Vsi-interface","Vsi")
+        elif interface.startswith("Vlan-interface"):
+            interface = interface.replace("Vlan-interface","Vlan-int")
+        return interface
