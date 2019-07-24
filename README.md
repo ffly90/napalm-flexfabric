@@ -11,7 +11,7 @@ Beside the functions to handle the connection to the switch, the following funct
  * get_interfaces()
  * get_config()
 
-They have been tested on the following hardware:
+They have been tested on the following hardware with the corresponding firmware that was up to date 2019-07:
  * flexfabric 5824
  * flexfabric 5940
  * flexfabric 7910
