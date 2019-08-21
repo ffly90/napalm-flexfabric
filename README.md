@@ -16,6 +16,14 @@ They have been tested on the following hardware with the corresponding firmware 
  * flexfabric 5940
  * flexfabric 7910
 
+
+Documentation
+=============
+There are generic docstrings for all the NAPALM functions in the projects repository:
+https://github.com/napalm-automation/napalm/blob/develop/napalm/base/base.py
+
+
+
 Installation
 ============
 
