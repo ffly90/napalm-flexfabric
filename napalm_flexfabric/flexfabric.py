@@ -27,7 +27,11 @@ from napalm.base.exceptions import (
     ConnectionException,
 )
 
-from napalm.base.utils import py23_compat
+#only attempt to import py23_compat if python version less than 3
+import sys
+if sys.version_info[0] < 3:
+    from napalm.base.utils import py23_compat
+
 import napalm.base.constants as C
 import napalm.base.helpers
 import re
@@ -85,7 +89,7 @@ class FlexFabricDriver(NetworkDriver):
         self.interface_map = {}
 
         self.profile = ["flexfabric"]
-    
+
     def open(self):
         """Open a connection to the device"""
         device_type = 'hp_comware_ssh'
@@ -97,7 +101,7 @@ class FlexFabricDriver(NetworkDriver):
             **self.netmiko_optional_args)
         # ensure in enable mode
         self.device.enable()
-    
+
     def close(self):
         """Close the connection to the device."""
         self.device.disconnect()
@@ -145,7 +149,10 @@ class FlexFabricDriver(NetworkDriver):
 
         for command in commands:
             output = self._send_command(command)
-            cli_output[py23_compat.text_type(command)] = output
+            if sys.version_info[0] < 3:
+                cli_output[py23_compat.text_type(command)] = output
+            else:
+                cli_output = output
         return cli_output
 
     def get_facts(self):
@@ -206,17 +213,29 @@ class FlexFabricDriver(NetworkDriver):
                 continue
             if active:
                 interface_list.append(line.split()[0])
-        
-        return {
-            "uptime": int(uptime),
-            "vendor": vendor,
-            "os_version": py23_compat.text_type(os_version),
-            "serial_number": py23_compat.text_type(serial_number),
-            "model": py23_compat.text_type(model),
-            "hostname": py23_compat.text_type(hostname),
-            "fqdn": fqdn,
-            "interface_list": interface_list,
-        }
+        if sys.version_info[0] < 3:
+            return {
+                "uptime": int(uptime),
+                "vendor": vendor,
+                "os_version": py23_compat.text_type(os_version),
+                "serial_number": py23_compat.text_type(serial_number),
+                "model": py23_compat.text_type(model),
+                "hostname": py23_compat.text_type(hostname),
+                "fqdn": fqdn,
+                "interface_list": interface_list,
+            }
+        else:
+            return {
+                "uptime": int(uptime),
+                "vendor": vendor,
+                "os_version": os_version,
+                "serial_number": serial_number,
+                "model": model,
+                "hostname": hostname,
+                "fqdn": fqdn,
+                "interface_list": interface_list,
+            }
+
 
     def get_lldp_neighbors(self):
         """FlexFabric implementation of get_lldp_neighbors."""
@@ -247,16 +266,44 @@ class FlexFabricDriver(NetworkDriver):
         lldp = {}
         lldp_interfaces = []
 
-        if interface:
+        if interface:   #if interface specified
+            remote_port = ""
+            remote_sys = ""
             command = "display lldp neighbor-information interface {} verbose".format(interface)
-        else:
-            command = "display lldp neighbor-information verbose"
+            output = self._send_command(command)
 
-        lldp_entries = self._send_command(command)
+            for line in output.splitlines():
+                if line.startswith(" System name"):
+                    remote_sys = line[23:]
+                if line.startswith(" Port ID"):
+                    remote_port = line[23:]
+                #add more elements here TODO
+            lldp[interface] = [{ "remote_system_name": remote_sys, "remote_port": remote_port}]
 
-        #TODO
 
-        return {}
+        else:   #if didn't specify interface
+            command = "display lldp neighbor-information list"
+            output = self._send_command(command)
+            active = False
+            for line in output.splitlines():
+                if line.startswith("System Name"):
+                    active = True
+                    continue
+                if active:
+                    remote_sys, local_if, _, remote_port = line.split()
+                    lldp[local_if] = [{"remote_system_name": remote_sys, "remote_port": remote_port}]
+            if not lldp:
+                for line in output.splitlines():
+                    if line.startswith("Local Interface"):
+                        active = True
+                        continue
+                    if active:
+                        split_line = line.split()
+                        local_if, remote_port, remote_sys = split_line[0], split_line[-2], split_line[-1]
+                        lldp[local_if] = [{ "remote_system_name": remote_sys, "remote_port": remote_port}]
+        return lldp
+
+
 
 
 
@@ -352,7 +399,7 @@ class FlexFabricDriver(NetworkDriver):
         # power supply units
         # currently not implemented
         environment.setdefault('power', {})
-        environment['power']['invalid'] = {'status': True, 'output': -1.0, 'capacity': -1.0}
+        environment['power']['not implemented'] = {'status': True, 'output': -1.0, 'capacity': -1.0}
         #TODO
 
         # cpu usage
@@ -411,19 +458,28 @@ class FlexFabricDriver(NetworkDriver):
         if retrieve == "all" or get_startup or get_running:
             command1 = "display current-configuration"
             command2 = "display saved-configuration"
-            
             output1 = self._send_command(command1)
             output2 = self._send_command(command2)
-
-            return{
-                "startup": py23_compat.text_type(output2)
-                if get_startup
-                else "",
-                "running": py23_compat.text_type(output1)
-                if get_running
-                else "",
-                "candidate": ""
-            }
+            if sys.version_info[0] < 3:
+                return{
+                    "startup": py23_compat.text_type(output2)
+                    if get_startup
+                    else "",
+                    "running": py23_compat.text_type(output1)
+                    if get_running
+                    else "",
+                    "candidate": ""
+                }
+            else:
+                return{
+                    "startup": output2
+                    if get_startup
+                    else "",
+                    "running": output1
+                    if get_running
+                    else "",
+                    "candidate": "Not supported in Comware"
+                }
         else:
             return {"startup": "", "running": "", "candidate": ""}
 
@@ -556,3 +612,4 @@ class FlexFabricDriver(NetworkDriver):
         elif interface.startswith("Vlan-interface"):
             interface = interface.replace("Vlan-interface","Vlan-int")
         return interface
+
